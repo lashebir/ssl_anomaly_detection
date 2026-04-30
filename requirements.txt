@@ -1,0 +1,10 @@
+certstream
+requests
+confluent_kafka
+pandas
+numpy
+scikit-learn
+python-Levenshtein
+tldextract
+seaborn
+pyarrow
