@@ -1,313 +1,690 @@
 """
-Feature Engineering Notebook
-=============================
-Run cells top to bottom. Each section builds on the previous.
-Designed to work with:
-    certs_ct.jsonl                     — live CT log sample (mostly y=0)
-    certs_phishtank_historical.jsonl   — crt.sh phishing certs (y=1)
-    phishtank_labels.jsonl             — domain-level labels
+Feature Engineering for SSL Anomaly Detection
+==============================================
+
+Comprehensive feature extraction from SSL certificates and domains including:
+- SSL certificate-level features (age, validity, issuer, wildcards, SANs, org fields)
+- Domain-level features (entropy, hyphens, digits, misspellings, TLD, Levenshtein)
+- IP-level features (abuse status, scanner detection) - optional, requires API keys
+
+Usage:
+    from src.features.feature_engineering import FeatureEngineer
+
+    fe = FeatureEngineer()
+    df = pd.read_json("certs.jsonl", lines=True)
+    df_features = fe.extract_features(df)
 
 Install:
-    pip install pandas numpy matplotlib seaborn python-Levenshtein tldextract
+    pip install pandas numpy python-Levenshtein tldextract whois requests
 """
-
-# ── 0. Imports ─────────────────────────────────────────────────────────────────
 
 import json
 import math
 import warnings
 from collections import Counter
 from datetime import datetime, timezone
+from typing import Dict, List, Optional, Any
+import time
 
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import seaborn as sns
 from Levenshtein import distance as levenshtein
 import tldextract
 
 warnings.filterwarnings("ignore")
-sns.set_theme(style="whitegrid")
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# 1. LOAD AND COMBINE DATASETS
-# ═══════════════════════════════════════════════════════════════════════════════
 
-# Live CT log sample
-df_live = pd.read_json("certs_fallback.jsonl", lines=True)
-df_live["data_source"] = "ct_live"
+class FeatureEngineer:
+    """
+    Comprehensive feature extraction for SSL certificate anomaly detection.
 
-# Historical phishing certs (already labeled y=1)
-df_hist = pd.read_json("certs_phishtank_historical.jsonl", lines=True)
-df_hist["data_source"] = "crtsh_historical"
+    Features extracted:
+    - Certificate-level: age, validity, issuer, wildcards, SANs, org fields
+    - Domain-level: entropy, hyphens, digits, misspellings, TLD, brand distance
+    - IP-level (optional): abuse status, scanner detection
+    """
 
-# Labels for the live data
-labels = pd.read_json("phishtank_labels.jsonl", lines=True)
+    # Known high-risk TLDs (frequently abused)
+    HIGH_RISK_TLDS = {
+        "top", "xyz", "buzz", "click", "live", "online", "site",
+        "club", "work", "shop", "icu", "vip", "fun", "today",
+        "tk", "ml", "ga", "cf", "gq", "pw", "cc"
+    }
 
-print(f"Live certs:       {len(df_live):,}")
-print(f"Historical certs: {len(df_hist):,}")
-print(f"PhishTank labels: {len(labels):,}")
+    # Trusted/low-risk TLDs
+    LOW_RISK_TLDS = {"com", "org", "net", "edu", "gov", "co", "io", "dev", "app"}
+    TRUST_TLDS = {"gov", "edu", "mil"}
 
-# ── Explode domains (one row per domain) ──────────────────────────────────────
+    # Brand names for typosquatting detection
+    BRANDS = [
+        "paypal", "amazon", "apple", "microsoft", "google", "facebook",
+        "netflix", "instagram", "linkedin", "twitter", "dropbox", "gmail",
+        "outlook", "office365", "wellsfargo", "chase", "bankofamerica",
+        "coinbase", "binance", "metamask", "stripe", "shopify", "ebay",
+        "alibaba", "tencent", "baidu", "yahoo", "zoom", "slack"
+    ]
 
-def explode_domains(df):
-    d = (df.explode("domains")
-           .rename(columns={"domains": "domain"})
-           .dropna(subset=["domain"]))
-    d["domain"] = d["domain"].str.lower().str.strip().str.lstrip("*.")
-    d = d[d["domain"].str.len() > 0]
-    return d.reset_index(drop=True)
+    # Phishing keywords
+    PHISHING_KEYWORDS = [
+        "secure", "login", "verify", "account", "update", "banking",
+        "signin", "wallet", "confirm", "support", "help", "service",
+        "alert", "payment", "invoice", "validate", "suspend", "unlock"
+    ]
 
-df_live_d = explode_domains(df_live)
-df_hist_d = explode_domains(df_hist)
+    def __init__(
+        self,
+        use_whois: bool = False,
+        use_abuseipdb: bool = False,
+        use_greynoise: bool = False,
+        abuseipdb_key: Optional[str] = None,
+        greynoise_key: Optional[str] = None
+    ):
+        """
+        Initialize feature engineer.
 
-# Label live data via PhishTank join
-df_live_d = df_live_d.merge(
-    labels[["domain", "y", "label_source"]],
-    on="domain", how="left"
-)
-df_live_d["y"] = df_live_d["y"].fillna(0).astype(int)
+        Args:
+            use_whois: Enable WHOIS domain age lookup (slow, may be rate-limited)
+            use_abuseipdb: Enable AbuseIPDB abuse score lookup (requires API key)
+            use_greynoise: Enable GreyNoise scanner detection (requires API key)
+            abuseipdb_key: AbuseIPDB API key (free tier: 1000 requests/day)
+            greynoise_key: GreyNoise API key (free tier: 50 requests/day)
+        """
+        self.use_whois = use_whois
+        self.use_abuseipdb = use_abuseipdb
+        self.use_greynoise = use_greynoise
+        self.abuseipdb_key = abuseipdb_key
+        self.greynoise_key = greynoise_key
 
-# Combine — historical is pre-labeled
-df = pd.concat([df_live_d, df_hist_d], ignore_index=True)
-df["y"] = df["y"].fillna(1).astype(int)  # hist records are all phishing
+        # Cache for expensive lookups
+        self._whois_cache = {}
+        self._abuseipdb_cache = {}
+        self._greynoise_cache = {}
 
-print(f"\nCombined domain rows: {len(df):,}")
-print(df["y"].value_counts().rename({0: "legitimate/unknown", 1: "phishing"}))
-print(f"\nPhishing rate: {df['y'].mean():.4%}")
+    # =========================================================================
+    # DOMAIN-LEVEL FEATURES
+    # =========================================================================
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# 2. RAW DATA INSPECTION
-# Do this before engineering anything.
-# ═══════════════════════════════════════════════════════════════════════════════
+    @staticmethod
+    def domain_entropy(domain: str) -> float:
+        """
+        Calculate Shannon entropy of domain (excluding dots).
+        Higher entropy = more random = suspicious.
 
-print("\n── Column dtypes ────────────────────────────────────────")
-print(df.dtypes)
+        Args:
+            domain: Domain name (e.g., "example.com")
 
-print("\n── Null counts ──────────────────────────────────────────")
-print(df.isnull().sum())
+        Returns:
+            Entropy value (typically 0-5)
+        """
+        s = domain.replace(".", "")
+        if not s:
+            return 0.0
+        counts = Counter(s)
+        total = len(s)
+        return -sum((c / total) * math.log2(c / total) for c in counts.values())
 
-print("\n── Sample phishing rows ─────────────────────────────────")
-print(df[df["y"] == 1][["domain", "issuer", "not_before", "not_after"]].head(5).to_string())
+    @staticmethod
+    def subdomain_count(domain: str) -> int:
+        """
+        Count number of subdomain levels.
 
-print("\n── Sample legitimate rows ───────────────────────────────")
-print(df[df["y"] == 0][["domain", "issuer", "not_before", "not_after"]].head(5).to_string())
+        Examples:
+            www.example.com → 1
+            mail.secure.example.com → 2
+            example.com → 0
+        """
+        ext = tldextract.extract(domain)
+        if not ext.subdomain:
+            return 0
+        return len(ext.subdomain.split("."))
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# 3. FEATURE ENGINEERING
-# Add one feature at a time. Inspect distribution before moving on.
-# ═══════════════════════════════════════════════════════════════════════════════
+    @staticmethod
+    def hyphen_count(domain: str) -> int:
+        """Count hyphens in domain (often used in phishing)."""
+        return domain.count("-")
 
-# ── 3a. Domain entropy ────────────────────────────────────────────────────────
-# Measures randomness of characters. High entropy = random-looking = suspicious.
-# Strip dots — they're structural, not informative.
+    @staticmethod
+    def digit_count(domain: str) -> int:
+        """Count digits in domain."""
+        return sum(c.isdigit() for c in domain)
 
-def domain_entropy(domain: str) -> float:
-    s = domain.replace(".", "")
-    if not s:
-        return 0.0
-    counts = Counter(s)
-    total = len(s)
-    return -sum((c / total) * math.log2(c / total) for c in counts.values())
+    @staticmethod
+    def digit_ratio(domain: str) -> float:
+        """Ratio of digits to total characters (excluding dots)."""
+        s = domain.replace(".", "")
+        if not s:
+            return 0.0
+        return sum(c.isdigit() for c in s) / len(s)
 
-df["entropy"] = df["domain"].apply(domain_entropy)
+    @staticmethod
+    def vowel_consonant_ratio(domain: str) -> float:
+        """
+        Ratio of vowels to consonants (excluding dots and digits).
+        Suspicious domains may have unusual ratios.
+        """
+        s = domain.replace(".", "").lower()
+        letters = [c for c in s if c.isalpha()]
+        if not letters:
+            return 0.0
+        vowels = sum(c in "aeiou" for c in letters)
+        consonants = len(letters) - vowels
+        return vowels / consonants if consonants > 0 else 0.0
 
-# Inspect
-print("\n── Entropy by label ─────────────────────────────────────")
-print(df.groupby("y")["entropy"].describe().round(3))
+    @staticmethod
+    def consecutive_consonants(domain: str) -> int:
+        """
+        Max consecutive consonants.
+        Legitimate domains rarely have >4 consecutive consonants.
+        """
+        s = domain.replace(".", "").lower()
+        max_run = 0
+        current_run = 0
 
-fig, axes = plt.subplots(1, 2, figsize=(12, 4))
-for label, ax, color in zip([0, 1], axes, ["steelblue", "tomato"]):
-    df[df["y"] == label]["entropy"].hist(bins=40, ax=ax, color=color, alpha=0.8)
-    ax.set_title(f"Entropy — {'Phishing' if label else 'Legitimate'}")
-    ax.set_xlabel("Entropy")
-plt.tight_layout()
-plt.savefig("feat_entropy.png", dpi=100)
-plt.show()
-# ⚠️  Expected finding: entropy alone is noisy. Many legit CDN/tracking domains
-#     are high entropy. Use as one input to the model, not a standalone filter.
+        for c in s:
+            if c.isalpha() and c not in "aeiou":
+                current_run += 1
+                max_run = max(max_run, current_run)
+            else:
+                current_run = 0
 
-# ── 3b. Subdomain count ───────────────────────────────────────────────────────
-# Phishing often uses deep subdomain structures to bury the malicious part:
-# e.g. paypal.secure-login.malicious-site.com
+        return max_run
 
-def subdomain_count(domain: str) -> int:
-    ext = tldextract.extract(domain)
-    if not ext.subdomain:
+    def tld_risk(self, domain: str) -> int:
+        """
+        TLD risk score.
+
+        Returns:
+            0 = trusted (gov/edu/mil)
+            1 = low-risk (com/org/net)
+            2 = high-risk (xyz/top/tk)
+        """
+        ext = tldextract.extract(domain)
+        tld = ext.suffix.lower().split(".")[-1] if ext.suffix else ""
+
+        if tld in self.TRUST_TLDS:
+            return 0
+        if tld in self.HIGH_RISK_TLDS:
+            return 2
+        if tld in self.LOW_RISK_TLDS:
+            return 1
+        return 1  # unknown → neutral
+
+    def min_brand_distance(self, domain: str) -> int:
+        """
+        Minimum Levenshtein distance from registrable domain to any brand.
+        Lower distance = potential typosquatting.
+
+        Examples:
+            "paypa1.com" → distance 1 from "paypal"
+            "amazon-secure.com" → distance 0 from "amazon" (subdomain)
+        """
+        ext = tldextract.extract(domain)
+        base = ext.domain.lower() if ext.domain else domain
+        if not base:
+            return 999
+        return min(levenshtein(base, brand) for brand in self.BRANDS)
+
+    def closest_brand(self, domain: str) -> str:
+        """Return the brand name with minimum Levenshtein distance."""
+        ext = tldextract.extract(domain)
+        base = ext.domain.lower() if ext.domain else domain
+        if not base:
+            return "none"
+        return min(self.BRANDS, key=lambda b: levenshtein(base, b))
+
+    def keyword_count(self, domain: str) -> int:
+        """Count phishing-related keywords in domain."""
+        domain_lower = domain.lower()
+        return sum(kw in domain_lower for kw in self.PHISHING_KEYWORDS)
+
+    @staticmethod
+    def has_at_symbol(domain: str) -> int:
+        """Check for @ symbol (URL confusion trick)."""
+        return int("@" in domain)
+
+    @staticmethod
+    def has_ip_address(domain: str) -> int:
+        """
+        Check if domain contains IP address pattern.
+        Phishing often uses IP addresses instead of domains.
+        """
+        import re
+        ip_pattern = r'\d{1,3}[-\.]\d{1,3}[-\.]\d{1,3}[-\.]\d{1,3}'
+        return int(bool(re.search(ip_pattern, domain)))
+
+    # =========================================================================
+    # CERTIFICATE-LEVEL FEATURES
+    # =========================================================================
+
+    @staticmethod
+    def cert_age_days(not_before: int, reference_time: Optional[int] = None) -> float:
+        """
+        Certificate age in days from not_before to reference time.
+
+        Args:
+            not_before: Unix timestamp (not_before field)
+            reference_time: Unix timestamp (default: current time)
+
+        Returns:
+            Age in days
+        """
+        if reference_time is None:
+            reference_time = int(datetime.now(timezone.utc).timestamp())
+        return max(0, (reference_time - not_before) / 86400)
+
+    @staticmethod
+    def validity_days(not_before: int, not_after: int) -> float:
+        """
+        Certificate validity period in days.
+        Let's Encrypt: max 90 days
+        Traditional CAs: often 365-397 days
+        """
+        return max(0, (not_after - not_before) / 86400)
+
+    @staticmethod
+    def is_wildcard(domains: List[str]) -> int:
+        """Check if certificate uses wildcard (*.example.com)."""
+        if not domains:
+            return 0
+        return int(any(d.startswith("*.") or d.startswith("*") for d in domains))
+
+    @staticmethod
+    def san_count(domains: List[str]) -> int:
+        """
+        Count Subject Alternative Names (SANs).
+        Legitimate multi-domain certs may have many SANs.
+        Phishing often has 1-2 SANs.
+        """
+        return len(domains) if domains else 0
+
+    @staticmethod
+    def extract_issuer_org(issuer: Dict[str, Any]) -> Optional[str]:
+        """Extract issuer organization name."""
+        if isinstance(issuer, dict):
+            return issuer.get("O")
+        return None
+
+    @staticmethod
+    def extract_subject_org(subject: Dict[str, Any]) -> Optional[str]:
+        """Extract subject organization name (OV/EV certs only)."""
+        if isinstance(subject, dict):
+            return subject.get("O")
+        return None
+
+    @staticmethod
+    def extract_subject_ou(subject: Dict[str, Any]) -> Optional[str]:
+        """Extract subject organizational unit."""
+        if isinstance(subject, dict):
+            return subject.get("OU")
+        return None
+
+    @staticmethod
+    def extract_subject_country(subject: Dict[str, Any]) -> Optional[str]:
+        """Extract subject country code."""
+        if isinstance(subject, dict):
+            return subject.get("C")
+        return None
+
+    @staticmethod
+    def is_letsencrypt(issuer_org: Optional[str]) -> int:
+        """Check if issued by Let's Encrypt."""
+        if not issuer_org:
+            return 0
+        return int("let's encrypt" in issuer_org.lower())
+
+    @staticmethod
+    def is_self_signed(subject: Dict[str, Any], issuer: Dict[str, Any]) -> int:
+        """
+        Check if certificate appears self-signed.
+        Self-signed certs have identical subject and issuer.
+        """
+        if not isinstance(subject, dict) or not isinstance(issuer, dict):
+            return 0
+        return int(subject.get("CN") == issuer.get("CN") and
+                  subject.get("O") == issuer.get("O"))
+
+    @staticmethod
+    def has_subject_org(subject: Dict[str, Any]) -> int:
+        """
+        Check if subject has organization field.
+        OV/EV certs have this; DV certs do not.
+        """
+        if isinstance(subject, dict):
+            return int(subject.get("O") is not None)
         return 0
-    return len(ext.subdomain.split("."))
 
-df["subdomain_count"] = df["domain"].apply(subdomain_count)
+    # =========================================================================
+    # EXTERNAL DATA FEATURES (OPTIONAL)
+    # =========================================================================
 
-print("\n── Subdomain count by label ─────────────────────────────")
-print(df.groupby("y")["subdomain_count"].value_counts().unstack(fill_value=0).head(6))
+    def domain_age_whois(self, domain: str) -> Optional[float]:
+        """
+        Get domain age in days from WHOIS.
 
-# ── 3c. Domain length ─────────────────────────────────────────────────────────
-# Phishing domains trend longer — stuffed with brand keywords + random strings.
+        WARNING: Slow and may be rate-limited.
+        Free tier: ~100 queries/day depending on registrar.
 
-df["domain_length"] = df["domain"].str.len()
+        Returns:
+            Age in days, or None if lookup fails
+        """
+        if not self.use_whois:
+            return None
 
-print("\n── Domain length by label ───────────────────────────────")
-print(df.groupby("y")["domain_length"].describe().round(1))
+        if domain in self._whois_cache:
+            return self._whois_cache[domain]
 
-# ── 3d. TLD risk ──────────────────────────────────────────────────────────────
-# Tiered risk: some TLDs are overwhelmingly abused, some are trust signals.
+        try:
+            import whois
+            w = whois.whois(domain)
+            if w.creation_date:
+                creation = w.creation_date
+                if isinstance(creation, list):
+                    creation = creation[0]
+                age_days = (datetime.now(timezone.utc) - creation).days
+                self._whois_cache[domain] = age_days
+                return age_days
+        except Exception as e:
+            print(f"WHOIS lookup failed for {domain}: {e}")
+            self._whois_cache[domain] = None
 
-HIGH_RISK_TLDS  = {"top", "xyz", "buzz", "click", "live", "online", "site",
-                   "club", "work", "shop", "icu", "vip", "fun", "today"}
-LOW_RISK_TLDS   = {"com", "org", "net", "edu", "gov", "co", "io", "dev"}
-TRUST_TLDS      = {"gov", "edu", "mil"}
+        return None
 
-def tld_risk(domain: str) -> int:
-    """2 = high risk, 1 = neutral, 0 = low risk / trust signal"""
-    ext = tldextract.extract(domain)
-    tld = ext.suffix.lower().split(".")[-1] if ext.suffix else ""
-    if tld in TRUST_TLDS:
-        return 0
-    if tld in HIGH_RISK_TLDS:
-        return 2
-    if tld in LOW_RISK_TLDS:
-        return 1
-    return 1  # unknown TLD → neutral
+    def abuseipdb_score(self, ip: str) -> Optional[int]:
+        """
+        Get AbuseIPDB abuse confidence score (0-100).
 
-df["tld"] = df["domain"].apply(lambda d: tldextract.extract(d).suffix.lower())
-df["tld_risk"] = df["domain"].apply(tld_risk)
+        Requires: AbuseIPDB API key
+        Free tier: 1000 requests/day
 
-print("\n── TLD risk distribution by label ───────────────────────")
-print(df.groupby("y")["tld_risk"].value_counts(normalize=True).unstack().round(3))
+        Returns:
+            Abuse score (0-100), or None if lookup fails
+        """
+        if not self.use_abuseipdb or not self.abuseipdb_key:
+            return None
 
-print("\n── Top TLDs in phishing certs ───────────────────────────")
-print(df[df["y"] == 1]["tld"].value_counts().head(15))
+        if ip in self._abuseipdb_cache:
+            return self._abuseipdb_cache[ip]
 
-# ── 3e. Issuer features ───────────────────────────────────────────────────────
+        try:
+            import requests
+            url = "https://api.abuseipdb.com/api/v2/check"
+            headers = {
+                "Key": self.abuseipdb_key,
+                "Accept": "application/json"
+            }
+            params = {"ipAddress": ip, "maxAgeInDays": 90}
 
-def issuer_org(row) -> str | None:
-    if isinstance(row, dict):
-        return row.get("O")
-    return None
+            response = requests.get(url, headers=headers, params=params, timeout=5)
+            response.raise_for_status()
 
-df["issuer_org"]      = df["issuer"].apply(issuer_org)
-df["is_letsencrypt"]  = df["issuer_org"].str.contains("Let's Encrypt", na=False).astype(int)
-df["has_org"]         = df["issuer_org"].notna().astype(int)  # OV/EV cert signal
+            data = response.json()
+            score = data.get("data", {}).get("abuseConfidenceScore", 0)
+            self._abuseipdb_cache[ip] = score
 
-print("\n── Let's Encrypt rate by label ──────────────────────────")
-print(df.groupby("y")["is_letsencrypt"].mean().round(4))
+            # Rate limit: 1 req/sec on free tier
+            time.sleep(1)
+            return score
+        except Exception as e:
+            print(f"AbuseIPDB lookup failed for {ip}: {e}")
+            self._abuseipdb_cache[ip] = None
 
-print("\n── Has organisation (OV/EV) by label ───────────────────")
-print(df.groupby("y")["has_org"].mean().round(4))
+        return None
 
-# ── 3f. Validity duration ─────────────────────────────────────────────────────
-# LE max is 90 days. Legit long-running services often get 1yr certs.
-# Very short validity on a suspicious domain = strong signal.
+    def greynoise_classification(self, ip: str) -> Optional[str]:
+        """
+        Get GreyNoise classification (benign/malicious/unknown).
 
-df["validity_days"] = ((df["not_after"] - df["not_before"]) / 86400).round(1)
-df["validity_days"] = df["validity_days"].clip(lower=0, upper=3650)  # cap outliers
+        Requires: GreyNoise API key
+        Free tier: 50 requests/day
 
-print("\n── Validity duration by label (days) ────────────────────")
-print(df.groupby("y")["validity_days"].describe().round(1))
+        Returns:
+            "benign", "malicious", "unknown", or None if lookup fails
+        """
+        if not self.use_greynoise or not self.greynoise_key:
+            return None
 
-# ── 3g. Brand distance ────────────────────────────────────────────────────────
-# Minimum Levenshtein distance from the registrable domain to any brand name.
-# Low distance = looks like a known brand = suspicious.
-# Compute on registrable domain only (not subdomains).
+        if ip in self._greynoise_cache:
+            return self._greynoise_cache[ip]
 
-BRANDS = [
-    "paypal", "amazon", "apple", "microsoft", "google", "facebook",
-    "netflix", "instagram", "linkedin", "twitter", "dropbox", "gmail",
-    "outlook", "office365", "wellsfargo", "chase", "bankofamerica",
-    "coinbase", "binance", "metamask",
-]
+        try:
+            import requests
+            url = f"https://api.greynoise.io/v3/community/{ip}"
+            headers = {"key": self.greynoise_key}
 
-def min_brand_distance(domain: str) -> int:
-    ext = tldextract.extract(domain)
-    base = ext.domain.lower() if ext.domain else domain
-    return min(levenshtein(base, brand) for brand in BRANDS)
+            response = requests.get(url, headers=headers, timeout=5)
+            response.raise_for_status()
 
-def closest_brand(domain: str) -> str:
-    ext = tldextract.extract(domain)
-    base = ext.domain.lower() if ext.domain else domain
-    return min(BRANDS, key=lambda b: levenshtein(base, b))
+            data = response.json()
+            classification = data.get("classification", "unknown")
+            self._greynoise_cache[ip] = classification
 
-# NOTE: This is the slowest feature (~1-2 min on 100k rows).
-# Run once, cache to disk.
-print("\nComputing brand distances (slow — ~1-2 min) …")
-df["brand_distance"]       = df["domain"].apply(min_brand_distance)
-df["closest_brand"]        = df["domain"].apply(closest_brand)
-df["is_brand_lookalike"]   = (df["brand_distance"] <= 3).astype(int)
+            # Rate limit: 1 req/sec recommended
+            time.sleep(1)
+            return classification
+        except Exception as e:
+            print(f"GreyNoise lookup failed for {ip}: {e}")
+            self._greynoise_cache[ip] = None
 
-print("\n── Brand distance by label ──────────────────────────────")
-print(df.groupby("y")["brand_distance"].describe().round(2))
+        return None
 
-print("\n── Brand lookalike rate by label ────────────────────────")
-print(df.groupby("y")["is_brand_lookalike"].mean().round(4))
+    # =========================================================================
+    # MAIN FEATURE EXTRACTION
+    # =========================================================================
 
-print("\n── Most targeted brands in phishing ─────────────────────")
-print(df[df["y"] == 1]["closest_brand"].value_counts().head(10))
+    def extract_domain_features(self, row: pd.Series) -> Dict[str, Any]:
+        """Extract all domain-level features from a certificate row."""
+        domain = row.get("domain", "")
 
-# ── 3h. Keyword presence ──────────────────────────────────────────────────────
-# Phishing domains often contain trust-inducing words.
+        features = {
+            # Basic domain features
+            "domain_length": len(domain),
+            "entropy": self.domain_entropy(domain),
+            "subdomain_count": self.subdomain_count(domain),
+            "hyphen_count": self.hyphen_count(domain),
+            "digit_count": self.digit_count(domain),
+            "digit_ratio": self.digit_ratio(domain),
 
-PHISHING_KEYWORDS = [
-    "secure", "login", "verify", "account", "update", "banking",
-    "signin", "wallet", "confirm", "support", "help", "service",
-    "alert", "payment", "invoice",
-]
+            # Advanced domain features
+            "vowel_consonant_ratio": self.vowel_consonant_ratio(domain),
+            "consecutive_consonants": self.consecutive_consonants(domain),
+            "has_at_symbol": self.has_at_symbol(domain),
+            "has_ip_address": self.has_ip_address(domain),
 
-def keyword_count(domain: str) -> int:
-    return sum(kw in domain for kw in PHISHING_KEYWORDS)
+            # TLD features
+            "tld": tldextract.extract(domain).suffix.lower(),
+            "tld_risk": self.tld_risk(domain),
 
-df["keyword_count"] = df["domain"].apply(keyword_count)
-df["has_keyword"]   = (df["keyword_count"] > 0).astype(int)
+            # Brand/typosquatting features
+            "brand_distance": self.min_brand_distance(domain),
+            "closest_brand": self.closest_brand(domain),
+            "is_brand_lookalike": int(self.min_brand_distance(domain) <= 3),
 
-print("\n── Keyword presence by label ────────────────────────────")
-print(df.groupby("y")["has_keyword"].mean().round(4))
+            # Keyword features
+            "keyword_count": self.keyword_count(domain),
+            "has_keyword": int(self.keyword_count(domain) > 0),
+        }
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# 4. FEATURE SUMMARY AND CORRELATION
-# ═══════════════════════════════════════════════════════════════════════════════
+        # Optional: WHOIS domain age
+        if self.use_whois:
+            features["domain_age_days"] = self.domain_age_whois(domain)
 
-FEATURE_COLS = [
-    "entropy", "subdomain_count", "domain_length", "tld_risk",
-    "is_letsencrypt", "has_org", "validity_days", "brand_distance",
-    "is_brand_lookalike", "keyword_count",
-]
+        return features
 
-print("\n── Feature means by label ───────────────────────────────")
-print(df.groupby("y")[FEATURE_COLS].mean().round(3).T.rename(columns={0: "legit", 1: "phishing"}))
+    def extract_cert_features(self, row: pd.Series) -> Dict[str, Any]:
+        """Extract all certificate-level features from a certificate row."""
+        features = {
+            # Certificate age and validity
+            "cert_age_days": self.cert_age_days(row.get("not_before", 0)),
+            "validity_days": self.validity_days(
+                row.get("not_before", 0),
+                row.get("not_after", 0)
+            ),
 
-# Correlation of each feature with label
-print("\n── Correlation with y (label) ───────────────────────────")
-corr = df[FEATURE_COLS + ["y"]].corr()["y"].drop("y").sort_values(key=abs, ascending=False)
-print(corr.round(3))
+            # Wildcard and SAN features
+            "is_wildcard": self.is_wildcard(row.get("domains", [])),
+            "san_count": self.san_count(row.get("domains", [])),
 
-# Heatmap
-plt.figure(figsize=(10, 8))
-sns.heatmap(
-    df[FEATURE_COLS + ["y"]].corr(),
-    annot=True, fmt=".2f", cmap="RdBu_r", center=0,
-    square=True, linewidths=0.5,
-)
-plt.title("Feature correlation matrix")
-plt.tight_layout()
-plt.savefig("feat_correlation.png", dpi=100)
-plt.show()
+            # Issuer features
+            "issuer_org": self.extract_issuer_org(row.get("issuer", {})),
+            "is_letsencrypt": self.is_letsencrypt(
+                self.extract_issuer_org(row.get("issuer", {}))
+            ),
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# 5. SAVE FEATURE MATRIX
-# ═══════════════════════════════════════════════════════════════════════════════
+            # Subject features (OV/EV signals)
+            "subject_org": self.extract_subject_org(row.get("subject", {})),
+            "subject_ou": self.extract_subject_ou(row.get("subject", {})),
+            "subject_country": self.extract_subject_country(row.get("subject", {})),
+            "has_subject_org": self.has_subject_org(row.get("subject", {})),
 
-# Save full feature matrix — use for model training in next notebook
-df_features = df[["domain", "fingerprint", "data_source", "y"] + FEATURE_COLS].copy()
-df_features.to_parquet("features.parquet", index=False)
-print(f"\nSaved feature matrix: features.parquet ({len(df_features):,} rows)")
+            # Self-signed check
+            "is_self_signed": self.is_self_signed(
+                row.get("subject", {}),
+                row.get("issuer", {})
+            ),
+        }
 
-# Save only live data for time series work
-df_ts = df[df["data_source"] == "ct_live"][["domain", "timestamp", "y"] + FEATURE_COLS].copy()
-df_ts.to_parquet("features_timeseries.parquet", index=False)
-print(f"Saved time series slice: features_timeseries.parquet ({len(df_ts):,} rows)")
+        return features
 
-print("\n── Next steps ───────────────────────────────────────────")
-print("1. Review feat_entropy.png and feat_correlation.png")
-print("2. Drop features with |correlation| < 0.02 — they add noise not signal")
-print("3. Move to model_training.py with features.parquet")
-print("4. Use features_timeseries.parquet for campaign/anomaly work")
+    def extract_features(
+        self,
+        df: pd.DataFrame,
+        explode_domains: bool = True,
+        verbose: bool = True
+    ) -> pd.DataFrame:
+        """
+        Extract all features from certificate dataframe.
+
+        Args:
+            df: Certificate dataframe with columns: domains, not_before, not_after,
+                issuer, subject, etc.
+            explode_domains: If True, explode multi-domain certs to one row per domain
+            verbose: Print progress messages
+
+        Returns:
+            DataFrame with all features extracted
+        """
+        if verbose:
+            print(f"Extracting features from {len(df):,} certificates...")
+
+        df_out = df.copy()
+
+        # Explode domains if requested
+        if explode_domains:
+            if verbose:
+                print("  - Exploding domains (one row per domain)...")
+            df_out = (df_out
+                .explode("domains")
+                .rename(columns={"domains": "domain"})
+                .dropna(subset=["domain"])
+                .reset_index(drop=True)
+            )
+            df_out["domain"] = (df_out["domain"]
+                .str.lower()
+                .str.strip()
+                .str.lstrip("*.")
+            )
+            df_out = df_out[df_out["domain"].str.len() > 0]
+
+        # Extract certificate features
+        if verbose:
+            print("  - Extracting certificate features...")
+        cert_features = df_out.apply(self.extract_cert_features, axis=1, result_type="expand")
+        df_out = pd.concat([df_out, cert_features], axis=1)
+
+        # Extract domain features
+        if verbose:
+            print("  - Extracting domain features...")
+        domain_features = df_out.apply(self.extract_domain_features, axis=1, result_type="expand")
+        df_out = pd.concat([df_out, domain_features], axis=1)
+
+        if verbose:
+            print(f"✅ Feature extraction complete: {len(df_out):,} rows, "
+                  f"{len(cert_features.columns) + len(domain_features.columns)} features")
+
+        return df_out
+
+    def get_feature_list(self) -> List[str]:
+        """
+        Get list of all feature column names.
+        Useful for model training.
+        """
+        features = [
+            # Domain features
+            "domain_length", "entropy", "subdomain_count", "hyphen_count",
+            "digit_count", "digit_ratio", "vowel_consonant_ratio",
+            "consecutive_consonants", "has_at_symbol", "has_ip_address",
+            "tld_risk", "brand_distance", "is_brand_lookalike",
+            "keyword_count", "has_keyword",
+
+            # Certificate features
+            "cert_age_days", "validity_days", "is_wildcard", "san_count",
+            "is_letsencrypt", "has_subject_org", "is_self_signed",
+        ]
+
+        # Add optional features
+        if self.use_whois:
+            features.append("domain_age_days")
+
+        return features
+
+
+# =============================================================================
+# CONVENIENCE FUNCTIONS
+# =============================================================================
+
+def extract_features_from_jsonl(
+    input_path: str,
+    output_path: str,
+    use_whois: bool = False,
+    use_abuseipdb: bool = False,
+    use_greynoise: bool = False,
+    abuseipdb_key: Optional[str] = None,
+    greynoise_key: Optional[str] = None
+) -> pd.DataFrame:
+    """
+    Extract features from JSONL certificate file and save to parquet.
+
+    Args:
+        input_path: Path to input JSONL file
+        output_path: Path to output parquet file
+        use_whois: Enable WHOIS lookups
+        use_abuseipdb: Enable AbuseIPDB lookups
+        use_greynoise: Enable GreyNoise lookups
+        abuseipdb_key: AbuseIPDB API key
+        greynoise_key: GreyNoise API key
+
+    Returns:
+        DataFrame with extracted features
+    """
+    print(f"Loading certificates from {input_path}...")
+    df = pd.read_json(input_path, lines=True)
+
+    fe = FeatureEngineer(
+        use_whois=use_whois,
+        use_abuseipdb=use_abuseipdb,
+        use_greynoise=use_greynoise,
+        abuseipdb_key=abuseipdb_key,
+        greynoise_key=greynoise_key
+    )
+
+    df_features = fe.extract_features(df)
+
+    print(f"Saving features to {output_path}...")
+    df_features.to_parquet(output_path, index=False)
+    print(f"✅ Done: {len(df_features):,} rows saved")
+
+    return df_features
+
+
+if __name__ == "__main__":
+    # Example usage
+    import sys
+
+    if len(sys.argv) < 3:
+        print("Usage: python feature_engineering.py <input.jsonl> <output.parquet>")
+        sys.exit(1)
+
+    input_file = sys.argv[1]
+    output_file = sys.argv[2]
+
+    extract_features_from_jsonl(input_file, output_file)
