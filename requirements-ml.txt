@@ -1,0 +1,27 @@
+# Machine Learning Dependencies for SSL Anomaly Detection
+# Install with: pip install -r requirements-ml.txt
+
+# Core ML
+xgboost>=2.0.0
+scikit-learn>=1.3.0
+joblib>=1.3.0
+
+# Data processing (should already be installed)
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Visualization
+matplotlib>=3.7.0
+seaborn>=0.12.0
+
+# Feature engineering dependencies
+python-Levenshtein>=0.21.0
+tldextract>=5.0.0
+
+# Optional: WHOIS and IP reputation
+python-whois>=0.8.0
+requests>=2.31.0
+
+# Development
+jupyter>=1.0.0
+ipykernel>=6.25.0

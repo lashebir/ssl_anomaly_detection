@@ -672,11 +672,13 @@ def normalize_crtsh_record(raw: dict, phishing_domain: str, label_ts: str) -> di
         def parse_ts(s):
             if not s:
                 return None
-            try:
-                return datetime.strptime(s, "%Y-%m-%d %H:%M:%S").replace(
-                    tzinfo=timezone.utc).timestamp()
-            except ValueError:
-                return None
+            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S.%f"):
+                try:
+                    return datetime.strptime(s, fmt).replace(tzinfo=timezone.utc).timestamp()
+                except ValueError:
+                    continue
+            log.debug("Could not parse timestamp: %s", s)
+            return None
 
         # Parse issuer DN
         issuer_str = raw.get("issuer_name", "") or ""
@@ -872,9 +874,9 @@ def create_parser():
         "live",
         help="Integrated pipeline: collect certs + refresh labels"
     )
-    live_pipeline.add_argument("--certs", default="data/raw/certs_fallback.jsonl",
+    live_pipeline.add_argument("--certs", default="sources/raw/certs_fallback.jsonl",
                                help="Certs output JSONL (default: certs_fallback.jsonl)")
-    live_pipeline.add_argument("--labels", default="data/raw/phishtank_labels.jsonl",
+    live_pipeline.add_argument("--labels", default="sources/raw/phishtank_labels.jsonl",
                                help="Labels output JSONL (default: phishtank_labels.jsonl)")
     live_pipeline.add_argument("--duration", type=int, default=900,
                                help="Seconds per cert collection batch (default: 900 or 15 minutes)")
@@ -896,7 +898,7 @@ def create_parser():
 
     # ── live-certs ────────────────────────────────────────────────────────────
     live = subparsers.add_parser("live-certs", help="Poll CT log for live certificates")
-    live.add_argument("-o", "--output", default="data/raw/certs_fallback.jsonl",
+    live.add_argument("-o", "--output", default="sources/raw/certs_fallback.jsonl",
                       help="Output JSONL file (default: certs_fallback.jsonl)")
     live.add_argument("--ct-log-url", default="https://ct.googleapis.com/logs/us1/argon2026h1/ct/v1",
                       help="CT log API URL")
@@ -916,8 +918,8 @@ def create_parser():
     )
     labels.add_argument("-c", "--certs", required=True,
                         help="Cert JSONL file to extract domains from (required)")
-    labels.add_argument("-o", "--output", default="data/raw/phishtank_labels.jsonl",
-                        help="Output JSONL file (default: data/raw/phishtank_labels.jsonl)")
+    labels.add_argument("-o", "--output", default="sources/raw/phishtank_labels.jsonl",
+                        help="Output JSONL file (default: sources/raw/phishtank_labels.jsonl)")
     labels.add_argument("--api-key",
                         help="PhishTank API key (or set PHISHTANK_API_KEY env var)")
     labels.add_argument("--phishtank-cache", default="phishtank_cache.csv",
@@ -930,8 +932,8 @@ def create_parser():
         "historical-phishing-labels",
         help="Import all PhishTank phishing domains as labels"
     )
-    phishing_labels.add_argument("-o", "--output", default="data/raw/phishing_labels.jsonl",
-                                 help="Output JSONL file (default: data/raw/phishing_labels.jsonl)")
+    phishing_labels.add_argument("-o", "--output", default="sources/raw/phishing_labels.jsonl",
+                                 help="Output JSONL file (default: sources/raw/phishing_labels.jsonl)")
     phishing_labels.add_argument("--api-key",
                                  help="PhishTank API key (or set PHISHTANK_API_KEY env var)")
     phishing_labels.add_argument("--phishtank-cache", default="phishtank_cache.csv",
@@ -943,7 +945,7 @@ def create_parser():
     hist = subparsers.add_parser("historical-phishing-certs", help="Fetch historical certs for phishing domains via crt.sh")
     hist.add_argument("-l", "--labels", required=True,
                       help="PhishTank labels JSONL file (required)")
-    hist.add_argument("-o", "--output", default="data/raw/certs_phishtank_historical.jsonl",
+    hist.add_argument("-o", "--output", default="sources/raw/certs_phishtank_historical.jsonl",
                       help="Output JSONL file (default: certs_phishtank_historical.jsonl)")
     hist.add_argument("--max-domains", type=int,
                       help="Limit to first N domains (default: all)")
@@ -956,7 +958,7 @@ def create_parser():
     windows = subparsers.add_parser("windows", help="Fetch CT windows around phishing certs")
     windows.add_argument("-p", "--phishing", required=True,
                          help="Phishing certs JSONL file (required)")
-    windows.add_argument("-o", "--output", default="data/raw/certs_ct_historical_windows.jsonl",
+    windows.add_argument("-o", "--output", default="sources/raw/certs_ct_historical_windows.jsonl",
                          help="Output JSONL file (default: certs_ct_historical_windows.jsonl)")
     windows.add_argument("--ct-log-url", default="https://ct.googleapis.com/logs/us1/argon2026h1/ct/v1",
                          help="CT log API URL")
