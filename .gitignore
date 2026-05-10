@@ -2,3 +2,5 @@ CLAUDE.md
 sources/
 notebooks/
 src/models/README.md
+phishtank_cache.csv
+tranco_top1m.csv
