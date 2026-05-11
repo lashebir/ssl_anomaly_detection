@@ -1,0 +1,14 @@
+# dbt profiles for SSL anomaly detection
+ssl_features:
+  target: dev
+  outputs:
+    dev:
+      type: duckdb
+      path: 'feature_store.duckdb'
+      schema: main
+      threads: 4
+      # DuckDB extensions
+      extensions:
+        - httpfs  # For reading remote files
+        - parquet # For parquet support
+        - json    # For JSON support

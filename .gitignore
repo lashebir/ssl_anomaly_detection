@@ -1,4 +1,62 @@
+# Documentation (user-specific)
 CLAUDE.md
+DASHBOARD_SETUP.md
+STREAMING_INTEGRATION.md
+DASHBOARD_USAGE.md
+SETUP_COMPLETE.md
+
+# Data files (large, generated)
 sources/
-notebooks/
-src/models/README.md
+*.jsonl
+*.parquet
+features*.parquet
+feature_store.duckdb
+*.duckdb
+*.duckdb.wal
+seeds/
+
+# Cache files
+phishtank_cache.csv
+tranco_top1m.csv
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Model files (can be regenerated)
+src/models/*.pkl
+!src/models/.gitkeep
+
+# Logs
+*.log
+stream.log
+pipeline.log
+nohup.out
+
+# dbt artifacts
+target/
+dbt_packages/
+logs/
+
+# Jupyter notebooks (keep in git, but ignore checkpoints)
+notebooks/.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Backup files
+backup_*.tar.gz
+
+# Streamlit cache
+.streamlit/
+
+# Python virtual environments
+venv/
+env/
+.venv/

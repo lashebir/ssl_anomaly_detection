@@ -1,0 +1,16 @@
+version: 2
+
+sources:
+  - name: raw
+    description: Raw certificate and label data from streaming ingestion
+    schema: raw
+    tables:
+      - name: certs
+        description: |
+          Raw SSL/TLS certificates from CT logs.
+          Schema includes: timestamp, domains, issuer, subject, not_before, not_after, etc.
+
+      - name: labels
+        description: |
+          Domain labels from PhishTank (phishing) and Tranco (legitimate).
+          Schema includes: domain, y (0/1), label_source, timestamp

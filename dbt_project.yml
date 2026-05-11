@@ -1,0 +1,57 @@
+# dbt project for SSL anomaly detection feature engineering
+name: 'ssl_features'
+version: '1.0.0'
+config-version: 2
+
+# Profile to use (defined in profiles.yml)
+profile: 'ssl_features'
+
+# Directories
+model-paths: ["models"]
+analysis-paths: ["analyses"]
+test-paths: ["tests"]
+seed-paths: ["seeds"]
+macro-paths: ["macros"]
+snapshot-paths: ["snapshots"]
+
+target-path: "target"
+clean-targets:
+  - "target"
+  - "dbt_packages"
+
+# Model configuration
+models:
+  ssl_features:
+    # Staging models - materialized as views (cheap, refresh on query)
+    staging:
+      +materialized: view
+      +schema: staging
+
+    # Intermediate models - materialized as tables (expensive computations)
+    intermediate:
+      +materialized: table
+      +schema: intermediate
+
+    # Final models - materialized as tables, exported to parquet
+    final:
+      +materialized: table
+      +schema: final
+
+# Seeds configuration (for lookup tables like brands, TLDs)
+seeds:
+  ssl_features:
+    +schema: seeds
+
+# Vars (can be overridden via CLI)
+vars:
+  # Temporal feature flags (set to false to avoid data leakage)
+  include_validity_days: false
+  include_is_letsencrypt: false
+
+  # File paths
+  certs_file: 'sources/raw/certs_streaming_48h.jsonl'
+  labels_file: 'sources/raw/labels_streaming_48h.jsonl'
+
+  # Feature store
+  duckdb_path: 'feature_store.duckdb'
+  output_parquet: 'features.parquet'
